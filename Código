@@ -1,0 +1,728 @@
+"""
+================================================================================
+DOMINÂNCIA FISCAL E RISCO SOBERANO NO BRASIL
+================================================================================
+TCC Insper 2026 | Nicolas Yuji Tibana | Orientador: Paulo Ribeiro
+
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.stats import norm, t as t_dist
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.patches as mpatches
+import warnings, os, sys, time
+warnings.filterwarnings('ignore')
+
+# ─────────────────────────────────────────────────────────────────
+# CONFIGURACAO
+# ─────────────────────────────────────────────────────────────────
+BASE_EXCEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'Base_TCC.xlsx')
+OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
+N_SEEDS    = 8
+
+LAM   = 0.929   # lambda: duration DPF ~3.5 anos
+PHI   = 0.95    # phi: persistencia Omega_t (mantido Corhay)
+SIG_C = 0.05    # sigma: volatilidade Omega_t (mantido Corhay)
+B_STAR= 0.467   # b*: divida/PIB media BR
+S_STAR= 0.009   # s*: superavit/PIB medio BR
+    
+C_AZUL='#2E75B6'; C_LARN='#C55A11'; C_VERM='#8B0000'
+C_VERDE='#375623'; C_CINZA='#595959'; C_ROXO='#7030A0'
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────────
+# 1. DADOS
+# ─────────────────────────────────────────────────────────────────
+def load_data(path=BASE_EXCEL):
+    import openpyxl
+    print(f"\n{'='*65}\nDados: {os.path.basename(path)}")
+    if not os.path.exists(path):
+        sys.exit(f"[ERRO] Nao encontrado: {path}")
+
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb['DATA']
+    rows = list(ws.iter_rows(min_row=1, values_only=True))
+    hdr = rows[1]; data_rows = rows[3:]
+
+    # Mapa direto por indice — estrutura fixa da base v7
+    # Base_TCC_Mensal_v7.xlsx tem 29 colunas (indices 0-28).
+    # Nao existe dummy_rec2001 na base — removida.
+    # Indices corrigidos: 27=dummy_covid, 28=dummy_teto_gastos
+    COL = {
+        0:'date',  1:'selic',    2:'ipca_mes',  3:'ipca_12m',
+        4:'fiscal_pib',  5:'divida_bruta_pib',
+        6:'log_div_bruta',  7:'log_div_bruta_lag',
+        8:'cds_5y',  9:'embi_plus',  10:'log_embi',
+        11:'term_premium',  12:'omega_t',  13:'breakeven_10y',
+        14:'juros_reais',   15:'yield_10y', 16:'ltn_12m',
+        17:'swap_360d',     18:'vix',       19:'log_vix',
+        20:'fed_rate',      21:'us_10y',    22:'us_2y',
+        23:'commodities',   24:'log_comm',  25:'usdbrl',
+        26:'spread_br_eua',
+        27:'dummy_covid',   28:'dummy_teto_gastos',
+    }
+
+    records = []
+    for row in data_rows:
+        if row[0] is None: continue
+        rec = {}
+        for i, name in COL.items():
+            if i >= len(row): continue
+            if name == 'date':
+                try:
+                    rec['date'] = pd.Timestamp(
+                        pd.Timestamp(row[i]).year,
+                        pd.Timestamp(row[i]).month, 1)
+                except: rec['date'] = pd.NaT
+            else:
+                rec[name] = pd.to_numeric(row[i], errors='coerce')
+        records.append(rec)
+
+    df = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
+    df = df.dropna(subset=['selic','ipca_mes','fiscal_pib','log_div_bruta_lag'])
+
+    print(f"  Periodo : {df['date'].min().strftime('%Y-%m')} -> "
+          f"{df['date'].max().strftime('%Y-%m')}")
+    print(f"  N = {len(df)} obs")
+    for col, lbl in [('cds_5y','CDS 5Y'),('embi_plus','EMBI+'),
+                     ('term_premium','Term Prem.'),('omega_t','Omega_t'),
+                     ('breakeven_10y','Breakeven'),('juros_reais','Juros Reais')]:
+        if col in df.columns:
+            n = df[col].notna().sum()
+            print(f"    {lbl:<16}: {n}/{len(df)} ({n/len(df)*100:.0f}%)")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────
+# 2. MARKOV-SWITCHING
+# ─────────────────────────────────────────────────────────────────
+def _filter(p, y_t, y_f, Xt, Xf):
+    T = len(y_t)
+    a   = p[0:2]
+    rp  = np.array([1+np.exp(np.clip(p[2],-5,5)),
+                    1-np.exp(np.clip(p[3],-5,5))])
+    sig = np.exp(np.clip(p[4:6],-3,3)) + 1e-8
+    g   = p[6:8]
+    db  = np.array([ np.exp(np.clip(p[8],-6,3)),
+                    -np.exp(np.clip(p[9],-6,3))])
+    om  = np.exp(np.clip(p[10:12],-3,3)) + 1e-8
+    pMM = 1/(1+np.exp(-np.clip(p[12],-8,8)))
+    pFF = 1/(1+np.exp(-np.clip(p[13],-8,8)))
+    P   = np.array([[pMM,1-pFF],[1-pMM,pFF]])
+
+    A  = np.vstack([(P.T-np.eye(2)), np.ones((1,2))])
+    bv = np.zeros(3); bv[-1] = 1
+    pi = np.linalg.lstsq(A, bv, rcond=None)[0]
+    pi = np.clip(pi,1e-6,1-1e-6); pi /= pi.sum()
+
+    mu_t = np.stack([a[s]+rp[s]*Xt[:,0] for s in range(2)], 1)
+    mu_f = np.stack([g[s]+db[s]*Xf[:,0] for s in range(2)], 1)
+    eta  = (norm.pdf(y_t[:,None]-mu_t, 0, sig) *
+            norm.pdf(y_f[:,None]-mu_f, 0, om))
+
+    xi_f = np.zeros((T,2)); xi_p = pi.copy(); ll = 0.0
+    for t in range(T):
+        ft = xi_p @ eta[t]
+        if ft < 1e-300: return 1e10, xi_f
+        ll += np.log(ft)
+        xi_f[t] = xi_p*eta[t]/ft
+        if t < T-1: xi_p = P.T @ xi_f[t]
+
+    prior = (4*np.log(pMM+1e-8)+np.log(1-pMM+1e-8) +
+             4*np.log(pFF+1e-8)+np.log(1-pFF+1e-8))
+    return -ll-prior, xi_f
+
+
+def _smooth(xi_f, P):
+    T, ns = xi_f.shape
+    xs = np.zeros_like(xi_f); xs[-1] = xi_f[-1]
+    for t in range(T-2,-1,-1):
+        pred = P @ xi_f[t]
+        for s in range(ns):
+            xs[t,s] = xi_f[t,s]*sum(P[s,j]*xs[t+1,j]/(pred[j]+1e-15)
+                                     for j in range(ns))
+        tot = xs[t].sum()
+        xs[t] = xs[t]/tot if tot > 1e-15 else xi_f[t]
+    return xs
+
+
+def estimate_ms(df, n_seeds=N_SEEDS):
+    def znorm(x): return (x-x.mean(0))/(x.std(0)+1e-8)
+
+    y_t = df['selic'].values
+    y_f = df['fiscal_pib'].values
+    Xt  = df[['ipca_mes']].values
+    Xf  = df[['log_div_bruta_lag']].values
+
+    yn=znorm(y_t); yfn=znorm(y_f)
+    Xtn=znorm(Xt); Xfn=znorm(Xf)
+    obj = lambda p: _filter(p, yn, yfn, Xtn, Xfn)[0]
+
+    seeds = [
+        [0.,0.,np.log(.80),np.log(.15),0.3,0.5,0.2,-0.1,-2.7,-3.5,0.,0.3,3.0,3.5],
+        [0.,0.,np.log(.90),np.log(.15),0.5,0.8,0.3,-0.2,-2.5,-3.8,-0.2,0.5,3.5,3.0],
+        [0.,0.,np.log(.70),np.log(.20),0.4,0.6,0.2,-0.1,-3.0,-4.0,0.1,0.4,2.8,3.2],
+        [0.,0.,np.log(.85),np.log(.12),0.6,0.7,0.4,-0.3,-2.3,-3.2,-0.3,0.6,3.8,2.8],
+        [0.,0.,np.log(.75),np.log(.18),0.4,0.5,0.1,-0.1,-2.8,-3.6,0.0,0.3,2.5,3.5],
+        [0.,0.,np.log(.95),np.log(.10),0.5,0.7,0.2,-0.2,-2.7,-3.5,0.0,0.5,3.2,2.5],
+        [0.,0.,np.log(.85),np.log(.15),0.5,0.6,0.3,-0.2,-3.2,-3.3,0.1,0.4,2.8,3.0],
+        [0.,0.,np.log(.80),np.log(.20),0.4,0.5,0.2,-0.2,-3.1,-3.4,0.0,0.4,2.6,3.0],
+    ][:n_seeds]
+
+    print(f"\n{'='*65}")
+    print(f"MARKOV-SWITCHING  |  N={len(df)}  |  {n_seeds} sementes  |  14 params")
+    print(f"Taylor: it=a(s)+rho_pi(s)*pi_t  |  Fiscal: st=g(s)+delta_b(s)*log(b_t-1)")
+    print(f"{'='*65}")
+
+    t0=time.time(); best_nll=1e10; best_p=None
+    for i,s in enumerate(seeds):
+        r = minimize(obj, np.array(s), method='Nelder-Mead',
+                     options={'maxiter':15000,'xatol':1e-8,'fatol':1e-8,'disp':False})
+        if np.isfinite(r.fun) and r.fun < best_nll:
+            best_nll=r.fun; best_p=r.x.copy()
+        rp1=1+np.exp(np.clip(r.x[2],-5,5)); rp2=1-np.exp(np.clip(r.x[3],-5,5))
+        pM=1/(1+np.exp(-r.x[12])); pF=1/(1+np.exp(-r.x[13]))
+        print(f"  S{i+1:2d}/{n_seeds}  NLL={r.fun:9.2f}  "
+              f"rho_pi=[{rp1:.3f},{rp2:.3f}]  pMM={pM:.4f}  pFF={pF:.4f}  "
+              f"{time.time()-t0:.0f}s")
+
+    if best_p is None: sys.exit("[ERRO] Nenhuma semente convergiu")
+
+    p   = best_p
+    rp1 = 1+np.exp(np.clip(p[2],-5,5))
+    rp2 = 1-np.exp(np.clip(p[3],-5,5))
+    sig = np.exp(np.clip(p[4:6],-3,3))
+    db1 =  np.exp(np.clip(p[8],-6,3))
+    db2 = -np.exp(np.clip(p[9],-6,3))
+    om  = np.exp(np.clip(p[10:12],-3,3))
+    pMM = 1/(1+np.exp(-p[12])); pFF=1/(1+np.exp(-p[13]))
+    P   = np.array([[pMM,1-pFF],[1-pMM,pFF]])
+    _, xi_f  = _filter(p, yn, yfn, Xtn, Xfn)
+    xi_s     = _smooth(xi_f, P)
+    regime   = np.argmax(xi_s, axis=1)
+    n_trocas = int((np.diff(regime)!=0).sum())
+    T_, k    = len(df), 14
+
+    return dict(params=p, rp1=rp1, rp2=rp2, sig=sig,
+                db1=db1, db2=db2, om=om, pMM=pMM, pFF=pFF, P=P,
+                xi_filt=xi_f, xi_smooth=xi_s, regime=regime,
+                nll=best_nll, aic=2*best_nll+2*k,
+                bic=2*best_nll+k*np.log(T_), n_trocas=n_trocas)
+
+
+def print_ms(res, df):
+    xi_s=res['xi_smooth']; reg=res['regime']
+    dur_M=1/(1-res['pMM']+1e-10); dur_F=1/(1-res['pFF']+1e-10)
+    print(f"\n{'='*65}")
+    print(f"RESULTADOS MS  |  Trocas={res['n_trocas']}  "
+          f"|  AIC={res['aic']:.1f}  BIC={res['bic']:.1f}")
+    print(f"{'='*65}")
+    print(f"  Regime M: rho_pi={res['rp1']:.4f}>1  delta_b={res['db1']:+.5f}>0  OK Leeper")
+    print(f"  Regime F: rho_pi={res['rp2']:.4f}<1  delta_b={res['db2']:+.5f}<0  OK Leeper")
+    print(f"  pMM={res['pMM']:.4f} ({dur_M:.1f}m)  pFF={res['pFF']:.4f} ({dur_F:.1f}m)")
+
+    eps=[]; in_ep=False
+    for t in range(len(df)):
+        rt=reg[t]
+        if not in_ep: ep_s=df['date'].iloc[t]; ep_r=rt; in_ep=True
+        elif rt!=ep_r:
+            eps.append((ep_r,ep_s,df['date'].iloc[t-1]))
+            ep_s=df['date'].iloc[t]; ep_r=rt
+    if in_ep: eps.append((ep_r,ep_s,df['date'].iloc[-1]))
+    print(f"\n  Episodios:")
+    for er,d0,d1 in eps:
+        lbl='Fiscal' if er==1 else 'Monetario'
+        nm=(d1.year-d0.year)*12+d1.month-d0.month+1
+        pm=xi_s[(df['date']>=d0)&(df['date']<=d1),er].mean()
+        print(f"    {lbl:<10}: {d0.strftime('%Y-%m')}->{d1.strftime('%Y-%m')} ({nm}m) P={pm:.3f}")
+
+    print(f"\n  Medias condicionais (excl. COVID):")
+    df_nc=df[df['dummy_covid']==0]; reg_nc=reg[df['dummy_covid'].values==0]
+    for dep,lbl in [('cds_5y','CDS 5Y'),('embi_plus','EMBI+'),
+                    ('term_premium','Term Prem.'),('juros_reais','Juros Reais')]:
+        if dep not in df_nc.columns: continue
+        vM=df_nc.loc[reg_nc==0,dep].dropna()
+        vF=df_nc.loc[reg_nc==1,dep].dropna()
+        if len(vM)<3 or len(vF)<3: continue
+        print(f"    {lbl:<14}: M={vM.mean():.2f}  F={vF.mean():.2f}  Delta={vF.mean()-vM.mean():+.2f}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# 3. MODELO SIMPLES CORHAY — APENDICE A (ilustrativo)
+# ─────────────────────────────────────────────────────────────────
+def corhay_model(rho_pi, delta_b,
+                 lam=LAM, phi=PHI, sigma=SIG_C,
+                 b_star=B_STAR, s_star=S_STAR):
+    k1 = b_star/(b_star+s_star)
+    k2 = 1/(b_star+s_star)
+    A1 = 1/(k1*phi + k2*delta_b - 1 + 1e-10)
+    H1 = 1/(rho_pi - phi + 1e-10)
+    TP_mon = -(lam+H1*sigma)*rho_pi*H1*sigma
+
+    def TP_f(O):
+        z1=k1*A1; d=1+rho_pi*O+1e-10
+        return rho_pi*(lam-z1*sigma/d)*(z1*sigma/d)
+
+    def dEpi(O):
+        return TP_f(O)/(1+rho_pi*O+1e-10)
+
+    return dict(A1=A1, H1=H1, TP_mon=TP_mon, TP_f=TP_f, dEpi=dEpi,
+                rho_pi=rho_pi, delta_b=delta_b, kappa1=k1, kappa2=k2,
+                lam=lam, phi=phi, sigma=sigma, b_star=b_star, s_star=s_star)
+
+
+def compute_irfs(m, T=40, omega_bar=1.0, shock=-0.50):
+    rO=m['phi']
+    Omega=np.array([omega_bar+shock*(rO**t) for t in range(T)])
+    TP=np.array([m['TP_f'](o) for o in Omega])
+    dEpi=np.array([m['dEpi'](o)*shock*(rO**t) for t,o in enumerate(Omega)])
+    return dict(periods=np.arange(T), Omega=Omega-omega_bar,
+                TP=(TP-TP[0])*10000, Epi=np.cumsum(dEpi)*10000)
+
+
+def print_corhay(mF, mM, omega_med):
+    print(f"\n{'='*65}")
+    print(f"MODELO SIMPLES CORHAY — APENDICE A  [ilustrativo]")
+    print(f"Calibracao BR: lam={mF['lam']:.3f}  b*={mF['b_star']:.3f}  s*={mF['s_star']:.4f}")
+    print(f"{'='*65}")
+    TP_F=mF['TP_f'](omega_med)*10000; dE_F=mF['dEpi'](omega_med)*10000
+    print(f"  Regime F: rho_pi={mF['rho_pi']:.4f}  delta_b={mF['delta_b']:.5f}")
+    print(f"    TP(Omega_med) A36 = {TP_F:.4f} bps")
+    print(f"    dE[pi]/dOmega A39 = {dE_F:.4f} bps  <- mecanismo central")
+    print(f"  Regime M: rho_pi={mM['rho_pi']:.4f}  delta_b={mM['delta_b']:.5f}")
+    print(f"    TP_mon A53 = {mM['TP_mon']*10000:.4f} bps  (Wallace neutrality)")
+
+
+# ─────────────────────────────────────────────────────────────────
+# 4. OLS-HAC — resultado principal
+# ─────────────────────────────────────────────────────────────────
+def newey_west(X, e, lags=12):
+    T,k=X.shape; S=X.T@np.diag(e**2)@X/T
+    for j in range(1,lags+1):
+        w=1-j/(lags+1); G=X[j:].T@np.diag(e[j:]*e[:-j])@X[:-j]/T
+        S+=w*(G+G.T)
+    return np.sqrt(np.diag(np.linalg.pinv(X.T@X/T)@S@np.linalg.pinv(X.T@X/T)/T))
+
+
+def _ols_hac(df_in, dep, xcols, lags=12):
+    avail=[c for c in xcols if c in df_in.columns]
+    if dep not in df_in.columns: return None
+    sub=df_in[[dep]+avail].dropna()
+    if len(sub)<24: return None
+    y=sub[dep].values
+    X=np.column_stack([np.ones(len(sub))]+[sub[c].values for c in avail])
+    b=np.linalg.lstsq(X,y,rcond=None)[0]; e=y-X@b
+    T_,k=len(y),X.shape[1]
+    se=newey_west(X,e,lags); ts=b/se; pv=2*(1-t_dist.cdf(np.abs(ts),df=T_-k))
+    r2=1-(e@e)/((y-y.mean())@(y-y.mean()))
+    r2a=1-(1-r2)*(T_-1)/(T_-k)
+    return dict(b=b,se=se,t=ts,p=pv,r2=r2,r2a=r2a,N=T_,
+                b1=b[1],se1=se[1],t1=ts[1],p1=pv[1],avail=avail)
+
+
+def run_ols(df, res):
+    df_r=df.copy(); df_r['prob_fiscal']=res['xi_smooth'][:,1]
+    # dummy_rec2001 nao existe na base v7 — removida
+    DUM=[d for d in ['dummy_covid','dummy_teto_gastos'] if d in df_r.columns]
+
+    # Para o breakeven, P(Fiscal) ~ 0.999 em quase toda a subamostra (fev/2014 em diante),
+    # gerando colinearidade perfeita com a constante. Solucao: usar delta_P_fiscal
+    # (primeira diferenca) como proxy de variacao de regime no breakeven.
+    df_r['delta_p_fiscal'] = df_r['prob_fiscal'].diff().fillna(0)
+
+    SPECS=[
+        ('M1 - Base',       ['prob_fiscal','omega_t'],                           False),
+        ('M2 - +Macro',     ['prob_fiscal','omega_t','selic','divida_bruta_pib'],False),
+        ('M3 - +Ext.',      ['prob_fiscal','omega_t','selic','divida_bruta_pib',
+                              'log_vix','fed_rate'],                              False),
+        ('M4 - Base+Dum',   ['prob_fiscal','omega_t'],                           True),
+        ('M5 - +Macro+Dum', ['prob_fiscal','omega_t','selic','divida_bruta_pib'],True),
+    ]
+    # Breakeven: P(Fiscal) excluido das especificacoes porque ~0.999 em toda a subamostra
+    # (fev/2014 em diante = todo fiscal). Incluir P(Fiscal) em nivel gera colinearidade
+    # perfeita com a constante -> coeficientes na casa de milhoes. 
+    # Solucao: usar apenas Selic, Omega_t e controles externos para o breakeven.
+    SPECS_BRK=[
+        ('M1 - Base',       ['omega_t'],                                             False),
+        ('M2 - +Macro',     ['omega_t','selic','divida_bruta_pib'],                  False),
+        ('M3 - +Ext.',      ['omega_t','selic','divida_bruta_pib',
+                              'log_vix','fed_rate'],                              False),
+        ('M4 - Base+Dum',   ['omega_t'],                                             True),
+        ('M5 - +Macro+Dum', ['omega_t','selic','divida_bruta_pib'],                  True),
+    ]
+    DEP_VARS=[
+        ('cds_5y','CDS Brasil 5Y (bps)'),
+        ('embi_plus','EMBI+ Brasil (bps)'),
+        ('term_premium','Term Premium 10Y-1Y (%)'),
+        ('breakeven_10y','Breakeven Inflacao 10Y (%)'),
+        ('juros_reais','Juros Reais Ex-Post (%)'),
+    ]
+    NOMES={'prob_fiscal':'P(Fiscal)','delta_p_fiscal':'dP(Fiscal)',
+           'omega_t':'Omega_t','selic':'Selic','divida_bruta_pib':'Div/PIB',
+           'log_vix':'log(VIX)','fed_rate':'FED',
+           'dummy_covid':'D.COVID','dummy_teto_gastos':'D.Teto'}
+
+    all_res={}
+    for dep,lbl in DEP_VARS:
+        if dep not in df_r.columns: continue
+        if dep == 'breakeven_10y':
+            print(f"\n{'='*65}")
+            print(f"{lbl}  [HAC 12 lags]")
+            print(f"{'='*65}")
+        else:
+            print(f"\n{'='*65}\n{lbl}  [HAC 12 lags]\n{'='*65}")
+        all_res[dep]={}
+        # Breakeven usa especificacoes alternativas com delta_P_fiscal
+        spec_list = SPECS_BRK if dep == 'breakeven_10y' else SPECS
+        for spec,xcols,has_d in spec_list:
+            cols=xcols+(DUM if has_d else [])
+            r=_ols_hac(df_r,dep,cols)
+            if r is None: print(f"  {spec}: N insuficiente"); continue
+            nm=['Const.']+[NOMES.get(v,v) for v in r['avail']]
+            sep='\n  --- COM DUMMIES ---' if has_d and not all_res[dep] else ''
+            print(f"{sep}\n  {spec}  N={r['N']}  R2={r['r2']:.3f}  R2adj={r['r2a']:.3f}")
+            print(f"  {'Var':<20} {'beta':>9} {'SE':>8} {'t':>7} {'p':>7}")
+            for nm_,b_,s_,t_,p_ in zip(nm,r['b'],r['se'],r['t'],r['p']):
+                sig='***' if p_<.01 else '**' if p_<.05 else '*' if p_<.10 else ''
+                print(f"  {nm_:<20} {b_:>9.4f} {s_:>8.4f} {t_:>7.3f} {p_:>7.4f} {sig}")
+            all_res[dep][spec]=r
+
+    print(f"\n  Dummies: D.2001(NBER), D.COVID(NBER+CODACE), D.Teto(EC95/2016)")
+    return all_res
+
+
+# ─────────────────────────────────────────────────────────────────
+# 5. TESTES DE ROBUSTEZ
+# ─────────────────────────────────────────────────────────────────
+def run_robustness(df, res):
+    """
+    Testes simples conforme orientacao do professor:
+    - Remove 12 meses do inicio ou fim da amostra
+    - Remove variaveis uma a uma
+    - O coeficiente de P(Fiscal) deve ser estavel
+    """
+    df_r=df.copy(); df_r['prob_fiscal']=res['xi_smooth'][:,1]
+    DUM=[d for d in ['dummy_covid','dummy_teto_gastos'] if d in df_r.columns]
+    BASE_X=['prob_fiscal','omega_t','selic','divida_bruta_pib']+DUM
+
+    DEP=[('cds_5y','CDS 5Y (bps)'),('embi_plus','EMBI+ (bps)'),
+         ('term_premium','Term Premium (%)'),('juros_reais','Juros Reais (%)')]
+
+    # (label, corte_inicio, corte_fim, xcols, dep_override)
+    TESTES=[
+        ('Base',             0,  0,  BASE_X,                                                    None),
+        ('T1 - Rem. 12m ini',12, 0,  BASE_X,                                                    None),
+        ('T2 - Rem. 12m fim', 0,12,  BASE_X,                                                    None),
+        ('T3 - Sem Omega_t',  0, 0,  ['prob_fiscal','selic','divida_bruta_pib']+DUM,             None),  # sem omega_t
+        ('T4 - Sem macro',    0, 0,  ['prob_fiscal','omega_t']+DUM,                              None),
+        ('T5 - Sem dummies',  0, 0,  ['prob_fiscal','omega_t','selic','divida_bruta_pib'],        None),
+        ('T6 - So D.Teto',    0, 0,  ['prob_fiscal','omega_t','selic',
+                                       'divida_bruta_pib','dummy_teto_gastos'],                   None),
+        ('T7 - log(EMBI)',    0, 0,  BASE_X,                                                    'log_embi'),
+    ]
+
+    print(f"\n{'='*70}")
+    print("TESTES DE ROBUSTEZ")
+    print("Criterio: beta P(Fiscal) deve ser estavel em magnitude e significancia")
+    print(f"{'='*70}")
+    print(f"Amostra base: {df_r['date'].min().strftime('%Y-%m')} -> "
+          f"{df_r['date'].max().strftime('%Y-%m')}  N={len(df_r)}")
+
+    results={}
+    for dep,dep_lbl in DEP:
+        print(f"\n  {'─'*65}")
+        print(f"  Dep.: {dep_lbl}")
+        print(f"  {'─'*65}")
+        print(f"  {'Teste':<28} {'N':>5}  {'beta P(Fis)':>11}  {'SE':>8}  "
+              f"{'t':>6}  {'p':>7}  {'sig':>4}  {'R2':>6}")
+        print(f"  {'─'*65}")
+        results[dep]={}
+
+        for lbl,n_ini,n_fim,xcols,dep_ov in TESTES:
+            n_fim_idx = len(df_r)-n_fim if n_fim>0 else len(df_r)
+            df_t=df_r.iloc[n_ini:n_fim_idx].reset_index(drop=True)
+
+            actual_dep=dep_ov if dep_ov else dep
+            # T7 so para embi_plus
+            if dep_ov is not None and dep!='embi_plus':
+                results[dep][lbl]=None; continue
+
+            r=_ols_hac(df_t,actual_dep,xcols)
+            results[dep][lbl]=r
+            if r is None:
+                print(f"  {lbl:<28} {'N<24':>5}"); continue
+
+            sig='***' if r['p1']<.01 else '**' if r['p1']<.05 else '*' if r['p1']<.10 else ''
+            print(f"  {lbl:<28} {r['N']:>5}  {r['b1']:>11.4f}  "
+                  f"{r['se1']:>8.4f}  {r['t1']:>6.2f}  "
+                  f"{r['p1']:>7.4f}  {sig:>4}  {r['r2']:>6.3f}")
+
+    print(f"\n  *** p<0.01  ** p<0.05  * p<0.10")
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────
+# 6. GRAFICOS
+# ─────────────────────────────────────────────────────────────────
+def _shade(ax, dates, xi_s):
+    f=xi_s[:,1]>0.5; in_ep=False
+    for t in range(len(dates)):
+        if f[t] and not in_ep: st=dates[t]; in_ep=True
+        elif not f[t] and in_ep:
+            ax.axvspan(pd.Timestamp(st),pd.Timestamp(dates[t-1]),
+                       color=C_LARN,alpha=0.18,zorder=0); in_ep=False
+    if in_ep: ax.axvspan(pd.Timestamp(st),pd.Timestamp(dates[-1]),
+                         color=C_LARN,alpha=0.18,zorder=0)
+
+def _events(ax):
+    ax.axvspan(pd.Timestamp('2020-02-01'),pd.Timestamp('2020-12-01'),
+               color='#CCCCCC',alpha=0.65,zorder=1)
+    ax.axvline(pd.Timestamp('2016-12-01'),color=C_AZUL,lw=0.9,ls=':',alpha=0.7)
+
+def _fmt(ax, title, ylabel=None):
+    ax.set_title(title,fontsize=8.5,fontweight='bold',pad=3)
+    ax.tick_params(labelsize=7); ax.set_facecolor('white')
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.xaxis.set_major_locator(mdates.YearLocator(4))
+    plt.setp(ax.xaxis.get_majorticklabels(),rotation=45,ha='right')
+    for sp in ax.spines.values(): sp.set_edgecolor('#CCCCCC')
+    ax.grid(axis='y',alpha=0.3,lw=0.5)
+    if ylabel: ax.set_ylabel(ylabel,fontsize=7.5)
+
+
+def plot_all(res, df, mF, mM, irfsF, irfsM, rob_res):
+    xi_s=res['xi_smooth']; dates=df['date'].values
+
+    # Fig 1 — Painel principal
+    fig=plt.figure(figsize=(18,26)); fig.patch.set_facecolor('#F5F7FA')
+    gs=fig.add_gridspec(6,2,hspace=0.50,wspace=0.30,
+                        left=0.07,right=0.97,top=0.94,bottom=0.04)
+    ax=fig.add_subplot(gs[0,:])
+    ax.fill_between(dates,xi_s[:,1],alpha=0.75,color=C_LARN,label='Dominancia Fiscal')
+    ax.fill_between(dates,xi_s[:,0],alpha=0.45,color=C_AZUL,label='Dominancia Monetaria')
+    ax.axhline(0.5,color='black',lw=0.9,ls='--',alpha=0.5)
+    _events(ax); ax.set_ylim(0,1)
+    ax.legend(loc='upper left',fontsize=8,framealpha=0.95)
+    ax.text(0.99,0.96,
+            f"N={len(df)} | Trocas={res['n_trocas']} | "
+            f"rho_pi(M)={res['rp1']:.3f} rho_pi(F)={res['rp2']:.3f} | "
+            f"pMM={res['pMM']:.3f} pFF={res['pFF']:.3f}",
+            transform=ax.transAxes,fontsize=7.5,ha='right',va='top',
+            bbox=dict(boxstyle='round',fc='white',ec='#AAAAAA',alpha=0.9))
+    _fmt(ax,'Probabilidades Suavizadas — Kim Smoother (1994)','P(regime)')
+
+    panels=[
+        ('selic','Selic (% a.a.)',C_AZUL,gs[1,0]),
+        ('fiscal_pib','Result. Primario/PIB (%)',C_VERDE,gs[1,1]),
+        ('cds_5y','CDS Brasil 5Y (bps)',C_CINZA,gs[2,0]),
+        ('embi_plus','EMBI+ Brasil (bps)',C_LARN,gs[2,1]),
+        ('term_premium','Term Premium 10Y-1Y (%)',C_VERM,gs[3,0]),
+        ('juros_reais','Juros Reais Ex-Post (%)',C_ROXO,gs[3,1]),
+        ('divida_bruta_pib','Divida Bruta/PIB (%)',C_VERM,gs[4,0]),
+        ('usdbrl','USD/BRL',C_CINZA,gs[4,1]),
+        ('omega_t','Omega_t = Y10/Y1',C_AZUL,gs[5,0]),
+        ('breakeven_10y','Breakeven 10Y (%)',C_ROXO,gs[5,1]),
+    ]
+    for col,title,color,gspec in panels:
+        ax=fig.add_subplot(gspec)
+        if col in df.columns and df[col].notna().sum()>3:
+            ax.plot(dates,df[col],color=color,lw=1.5)
+        _shade(ax,dates,xi_s); _events(ax); _fmt(ax,title)
+
+    plt.suptitle(
+        f"Dominancia Fiscal e Risco Soberano — Brasil (Mensal) | v6\n"
+        f"Corhay et al. (2023) + Leeper (1991) | mar/2000->nov/2025 | N={len(df)}\n"
+        f"rho_pi(M)={res['rp1']:.3f}  rho_pi(F)={res['rp2']:.3f}  |  "
+        f"delta_b(M)={res['db1']:.4f}  delta_b(F)={res['db2']:.4f}",
+        fontsize=10,fontweight='bold',y=0.97)
+    fig.legend(handles=[
+        mpatches.Patch(color=C_LARN,alpha=0.25,label='Dominancia Fiscal (P>50%)'),
+        mpatches.Patch(color='#CCCCCC',alpha=0.7,label='COVID (fev->dez/2020)'),
+    ],loc='lower center',fontsize=8,bbox_to_anchor=(0.5,0.005),framealpha=0.9)
+    p1=os.path.join(OUTPUT_DIR,'fig1_regimes_v7.png')
+    plt.savefig(p1,dpi=150,bbox_inches='tight'); plt.close(); print(f"\n[Fig 1] {p1}")
+
+    # Fig 2 — IRFs
+    fig2,axes=plt.subplots(1,3,figsize=(15,5)); fig2.patch.set_facecolor('#F5F7FA')
+    for ax,(k,lbl) in zip(axes,[('Omega','Maturidade Omega_t'),
+                                  ('Epi','E[pi] acumulado (bps)'),
+                                  ('TP','Term Premium (bps)')]):
+        ax.plot(irfsF['periods'],irfsF[k],color=C_AZUL,lw=2,label='Regime Fiscal')
+        ax.plot(irfsM['periods'],irfsM[k],color=C_LARN,lw=2,ls='--',label='Regime Monetario')
+        ax.axhline(0,color='black',lw=0.8,ls='--',alpha=0.5)
+        ax.set_title(lbl,fontsize=9,fontweight='bold')
+        ax.legend(fontsize=8); ax.grid(alpha=0.3); ax.set_facecolor('white')
+    plt.suptitle(
+        f"IRFs — Apendice A Corhay (2023) | choque Omega_t=-0.50\n"
+        f"lam={mF['lam']:.3f}  b*={mF['b_star']:.3f}  s*={mF['s_star']:.4f}  (Brasil)",
+        fontsize=9,fontweight='bold')
+    plt.tight_layout(rect=[0,0,1,0.90])
+    p2=os.path.join(OUTPUT_DIR,'fig2_irfs_v7.png')
+    plt.savefig(p2,dpi=150,bbox_inches='tight'); plt.close(); print(f"[Fig 2] {p2}")
+
+    # Fig 3 — Especificacoes M1-M5
+    df_r=df.copy(); df_r['prob_fiscal']=xi_s[:,1]
+    DUM=[d for d in ['dummy_covid','dummy_teto_gastos'] if d in df_r.columns]
+    SPECS_ROB=[
+        ('M1\ns/dum',['prob_fiscal','omega_t'],False),
+        ('M2\ns/dum',['prob_fiscal','omega_t','selic'],False),
+        ('M3\ns/dum',['prob_fiscal','omega_t','selic','divida_bruta_pib'],False),
+        ('M4\nc/dum',['prob_fiscal','omega_t'],True),
+        ('M5\nc/dum',['prob_fiscal','omega_t','selic','divida_bruta_pib'],True),
+    ]
+    DEP_ROB=[('cds_5y','CDS 5Y'),('embi_plus','EMBI+'),
+             ('term_premium','Term Prem.'),('juros_reais','Juros Reais'),
+             ('breakeven_10y','Breakeven')]
+    fig3,axes3=plt.subplots(2,3,figsize=(16,9)); fig3.patch.set_facecolor('#F5F7FA')
+    for ax_,(dep,lbl) in zip(axes3.flat,DEP_ROB+[(None,None)]):
+        if dep is None: ax_.axis('off'); continue
+        betas=[]; cis=[]; colors=[]
+        for _,xcols,has_d in SPECS_ROB:
+            cols=xcols+(DUM if has_d else [])
+            r=_ols_hac(df_r,dep,cols)
+            if r is None:
+                betas.append(np.nan); cis.append(np.nan); colors.append('#AAAAAA')
+            else:
+                betas.append(r['b1']); cis.append(1.96*r['se1'])
+                colors.append(C_LARN if has_d else C_AZUL)
+        xs=np.arange(len(SPECS_ROB))
+        valid=[(i,b,c) for i,(b,c) in enumerate(zip(betas,cis)) if not np.isnan(b)]
+        if valid:
+            xi_,bv,cv=zip(*valid)
+            ax_.bar(xi_,bv,color=[colors[i] for i in xi_],alpha=0.75,width=0.6,zorder=2)
+            ax_.errorbar(xi_,bv,yerr=cv,fmt='none',color='black',capsize=4,lw=1.5,zorder=3)
+        ax_.axhline(0,color='black',lw=0.8,ls='--',alpha=0.5)
+        ax_.set_xticks(xs); ax_.set_xticklabels([s[0] for s in SPECS_ROB],fontsize=7)
+        ax_.set_title(f'beta P(Fiscal) -> {lbl}',fontsize=9,fontweight='bold')
+        ax_.set_facecolor('white'); ax_.grid(axis='y',alpha=0.3)
+    fig3.legend(handles=[
+        mpatches.Patch(color=C_AZUL,alpha=0.75,label='Sem dummies'),
+        mpatches.Patch(color=C_LARN,alpha=0.75,label='Com dummies'),
+    ],loc='lower center',fontsize=9,bbox_to_anchor=(0.5,0.01),framealpha=0.9,ncol=2)
+    plt.suptitle('Especificacoes OLS — beta P(Fiscal) com IC 95% (HAC 12 lags)',
+                 fontsize=10,fontweight='bold')
+    plt.tight_layout(rect=[0,0,1,0.93])
+    p3=os.path.join(OUTPUT_DIR,'fig3_specs_v7.png')
+    plt.savefig(p3,dpi=150,bbox_inches='tight'); plt.close(); print(f"[Fig 3] {p3}")
+
+    # Fig 4 — Testes de robustez T1-T7
+    DEP_ROB2=[('cds_5y','CDS 5Y'),('embi_plus','EMBI+'),
+              ('term_premium','Term Prem.'),('juros_reais','Juros Reais')]
+    DUM_F=[d for d in ['dummy_covid','dummy_teto_gastos'] if d in df_r.columns]
+    BASE_X2=['prob_fiscal','omega_t','selic','divida_bruta_pib']+DUM_F
+    TESTES_4=[
+        ('Base',      0, 0, BASE_X2,                                                     None),
+        ('T1\nRem.ini',12,0, BASE_X2,                                                    None),
+        ('T2\nRem.fim', 0,12,BASE_X2,                                                    None),
+        ('T3\nSem Omega',0,0,['prob_fiscal','selic','divida_bruta_pib']+DUM_F,           None),
+        ('T4\nSem macro',0,0,['prob_fiscal','omega_t']+DUM_F,                            None),
+        ('T5\nSem dum.', 0,0,['prob_fiscal','omega_t','selic','divida_bruta_pib'],        None),
+        ('T6\nSo Teto',  0,0,['prob_fiscal','omega_t','selic',
+                               'divida_bruta_pib','dummy_teto_gastos'],                   None),
+    ]
+    fig4,axes4=plt.subplots(2,2,figsize=(14,9)); fig4.patch.set_facecolor('#F5F7FA')
+    fig4.suptitle(
+        'Testes de Robustez — beta P(Fiscal) por amostra e especificacao\n'
+        'Barras com IC 95% (HAC 12 lags)  |  linha tracejada = beta base',
+        fontsize=10,fontweight='bold')
+    for ax_,(dep,dep_lbl) in zip(axes4.flat,DEP_ROB2):
+        betas=[]; cis=[]; cols_color=[]; beta_base=None
+        for lbl,n_ini,n_fim,xcols,_ in TESTES_4:
+            n_fim_idx=len(df_r)-n_fim if n_fim>0 else len(df_r)
+            df_t=df_r.iloc[n_ini:n_fim_idx].reset_index(drop=True)
+            r=_ols_hac(df_t,dep,xcols)
+            if r is None:
+                betas.append(np.nan); cis.append(np.nan); cols_color.append('#DDDDDD')
+            else:
+                betas.append(r['b1']); cis.append(1.96*r['se1'])
+                cols_color.append(
+                    '#E6333A' if r['p1']<.05 else
+                    '#F5A623' if r['p1']<.10 else '#AAAAAA')
+                if lbl=='Base': beta_base=r['b1']
+        xs=np.arange(len(TESTES_4))
+        valid=[(i,b,c,cc) for i,(b,c,cc) in enumerate(zip(betas,cis,cols_color))
+               if not np.isnan(b)]
+        if valid:
+            xi_,bv,cv,cv_c=zip(*valid)
+            ax_.bar(xi_,bv,color=cv_c,alpha=0.82,width=0.6,zorder=2)
+            ax_.errorbar(xi_,bv,yerr=cv,fmt='none',color='black',capsize=4,lw=1.3,zorder=3)
+        if beta_base is not None:
+            ax_.axhline(beta_base,color=C_AZUL,lw=1.2,ls='--',alpha=0.7,
+                        label=f'beta base={beta_base:.3f}')
+        ax_.axhline(0,color='black',lw=0.8,ls='-',alpha=0.3)
+        ax_.set_xticks(xs)
+        ax_.set_xticklabels([t[0] for t in TESTES_4],fontsize=7)
+        ax_.set_title(dep_lbl,fontsize=9,fontweight='bold')
+        ax_.set_facecolor('white'); ax_.grid(axis='y',alpha=0.3)
+        ax_.tick_params(labelsize=7)
+        if beta_base is not None: ax_.legend(fontsize=7.5,framealpha=0.9)
+    fig4.legend(handles=[
+        mpatches.Patch(color='#E6333A',alpha=0.8,label='p < 0.05'),
+        mpatches.Patch(color='#F5A623',alpha=0.8,label='p < 0.10'),
+        mpatches.Patch(color='#AAAAAA',alpha=0.8,label='p >= 0.10'),
+    ],loc='lower center',fontsize=8,bbox_to_anchor=(0.5,0.01),ncol=3,framealpha=0.9)
+    plt.tight_layout(rect=[0,0.05,1,0.93])
+    p4=os.path.join(OUTPUT_DIR,'fig4_robustez_v7.png')
+    plt.savefig(p4,dpi=150,bbox_inches='tight'); plt.close(); print(f"[Fig 4] {p4}")
+
+    return p1,p2,p3,p4
+
+
+# ─────────────────────────────────────────────────────────────────
+# 7. EXPORTAR
+# ─────────────────────────────────────────────────────────────────
+def export_csv(df, res):
+    out=df.copy()
+    out['prob_monetario']=res['xi_smooth'][:,0]
+    out['prob_fiscal']   =res['xi_smooth'][:,1]
+    out['regime']        =np.where(res['regime']==0,'Monetario','Fiscal')
+    path=os.path.join(OUTPUT_DIR,'resultados_ms_v7.csv')
+    out.to_csv(path,index=False); print(f"[CSV] {path}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+
+    # 1. Dados
+    df = load_data(BASE_EXCEL)
+
+    # 2. Markov-Switching
+    res = estimate_ms(df, n_seeds=N_SEEDS)
+    print_ms(res, df)
+
+    # 3. Modelo Simples Corhay (Apendice A — ilustrativo)
+    mF = corhay_model(rho_pi=np.clip(res['rp2'],0.50,0.99),
+                      delta_b=np.clip(res['db2'],-0.15,-0.001))
+    mM = corhay_model(rho_pi=np.clip(res['rp1'],1.01,2.50),
+                      delta_b=np.clip(res['db1'],0.001,0.15))
+    omega_med = df['omega_t'].median() if 'omega_t' in df.columns else 1.06
+    print_corhay(mF, mM, omega_med)
+    irfsF = compute_irfs(mF, omega_bar=omega_med)
+    irfsM = compute_irfs(mM, omega_bar=omega_med)
+
+    # 4. OLS-HAC — resultado principal
+    run_ols(df, res)
+
+    # 5. Testes de robustez
+    rob_res = run_robustness(df, res)
+
+    # 6. Graficos (4 figuras)
+    plot_all(res, df, mF, mM, irfsF, irfsM, rob_res)
+
+    # 7. Export CSV
+    export_csv(df, res)
+
+    print(f"\n{'='*65}")
+    print(f"  Pipeline v7 concluido!")
+    print(f"  Saidas: fig1..fig4 + resultados_ms_v7.csv")
+    print(f"{'='*65}")
